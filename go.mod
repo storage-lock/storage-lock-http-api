@@ -22,3 +22,7 @@ require (
 	github.com/storage-lock/go-utils v0.0.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/storage-lock/go-storage-lock => ../go-storage-lock
+
+replace github.com/storage-lock/go-events => ../go-events

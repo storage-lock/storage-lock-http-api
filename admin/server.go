@@ -47,15 +47,15 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 type lockView struct {
-	LockID           string                `json:"lock_id"`
-	OwnerID          string                `json:"owner_id,omitempty"`
-	Held             bool                  `json:"held"`
-	ReadLock         bool                  `json:"read_lock"`
-	LockCount        int                   `json:"lock_count"`
-	Version          storage.Version       `json:"version"`
-	RemainingLease   string                `json:"remaining_lease,omitempty"`
-	WriteIntentOwner string                `json:"write_intent_owner,omitempty"`
-	Waiters          []storage.LockWaiter  `json:"waiters,omitempty"`
+	LockID           string               `json:"lock_id"`
+	OwnerID          string               `json:"owner_id,omitempty"`
+	Held             bool                 `json:"held"`
+	ReadLock         bool                 `json:"read_lock"`
+	LockCount        int                  `json:"lock_count"`
+	Version          storage.Version      `json:"version"`
+	RemainingLease   string               `json:"remaining_lease,omitempty"`
+	WriteIntentOwner string               `json:"write_intent_owner,omitempty"`
+	Waiters          []storage.LockWaiter `json:"waiters,omitempty"`
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +135,10 @@ func writeError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	if errors.Is(err, storage_lock.ErrLockNotFound) {
 		status = http.StatusNotFound
+	} else if errors.Is(err, storage_lock.ErrLockBusy) {
+		status = http.StatusConflict
+	} else if errors.Is(err, storage_lock.ErrOwnerIdEmpty) {
+		status = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), status)
 }
