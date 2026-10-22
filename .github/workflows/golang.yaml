@@ -17,20 +17,8 @@ jobs:
         working-directory: storage-lock-http-api
         run: go mod download
 
-      # 跨语言测试（TestCrossLanguageClients）需要 python/java 客户端库，
-      # 位于仓库平级目录（测试用 ../.. 相对路径定位）
-      - name: Checkout python-storage-lock
-        uses: actions/checkout@v4
-        with:
-          repository: storage-lock/python-storage-lock
-          path: python-storage-lock
-
-      - name: Checkout java-storage-lock
-        uses: actions/checkout@v4
-        with:
-          repository: storage-lock/java-storage-lock
-          path: java-storage-lock
-
+      # Cross-language client integration tests skip when the private client repos
+      # are not present in the public CI checkout.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
