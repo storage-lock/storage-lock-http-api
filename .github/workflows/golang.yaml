@@ -13,19 +13,9 @@ jobs:
         with:
           path: storage-lock-http-api
 
-      # 兄弟仓库未发布本仓库依赖的新 API，用本地 replace 指向平级目录：
-      # go-storage-lock（新的跨进程 Subscribe/WatchDog 语义）+ go-events（新语义事件类型）
-      - name: Checkout go-storage-lock
-        uses: actions/checkout@v4
-        with:
-          repository: storage-lock/go-storage-lock
-          path: go-storage-lock
-
-      - name: Checkout go-events
-        uses: actions/checkout@v4
-        with:
-          repository: storage-lock/go-events
-          path: go-events
+      - name: Prepare published dependencies
+        working-directory: storage-lock-http-api
+        run: go mod download
 
       # 跨语言测试（TestCrossLanguageClients）需要 python/java 客户端库，
       # 位于仓库平级目录（测试用 ../.. 相对路径定位）
