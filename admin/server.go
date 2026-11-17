@@ -112,6 +112,20 @@ func (s *Server) inspect(ctx context.Context, id string) (lockView, error) {
 	return s.view(&status.Information), nil
 }
 
+// viewFromStatus 直接采用同一次 Inspect 的持有标志和剩余租约，不再用另一套时钟重算。
+func viewFromStatus(status *storage_lock.LockStatus) lockView {
+	info := &status.Information
+	view := lockView{
+		LockID: info.LockId, OwnerID: info.OwnerId, Held: status.Held, ReadLock: info.ReadLock,
+		LockCount: info.LockCount, Version: info.Version, WriteIntentOwner: status.WriteIntentOwner,
+		Waiters: append([]storage.LockWaiter(nil), status.Waiters...),
+	}
+	if status.Held {
+		view.RemainingLease = status.RemainingLease.String()
+	}
+	return view
+}
+
 func (s *Server) view(info *storage.LockInformation) lockView {
 	now := s.now()
 	held := info.LockCount > 0 && now.Before(info.LeaseExpireTime)
@@ -133,12 +147,23 @@ func writeJSON(w http.ResponseWriter, value any) {
 
 func writeError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, storage_lock.ErrLockNotFound) {
+	switch {
+	case errors.Is(err, storage_lock.ErrLockNotFound):
 		status = http.StatusNotFound
-	} else if errors.Is(err, storage_lock.ErrLockBusy) {
+	case errors.Is(err, storage_lock.ErrLockBusy):
 		status = http.StatusConflict
-	} else if errors.Is(err, storage_lock.ErrOwnerIdEmpty) {
+	case errors.Is(err, storage_lock.ErrOwnerIdEmpty), errors.Is(err, storage_lock.ErrLeaseExpireAfter):
 		status = http.StatusBadRequest
+	case errors.Is(err, storage_lock.ErrNotYourTurn):
+		status = http.StatusForbidden
+	case errors.Is(err, storage_lock.ErrUpgradeConflict):
+		status = http.StatusUnprocessableEntity
+	case errors.Is(err, storage_lock.ErrLeaseExpired):
+		status = http.StatusGone
+	case errors.Is(err, storage_lock.ErrMaxReentrantDepth):
+		status = http.StatusTooManyRequests
+	case errors.Is(err, storage_lock.ErrLockNotBelongYou):
+		status = http.StatusLocked
 	}
 	http.Error(w, err.Error(), status)
 }

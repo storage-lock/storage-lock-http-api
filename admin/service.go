@@ -8,7 +8,6 @@ package admin
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -180,28 +179,63 @@ func (s *Service) acquire(w http.ResponseWriter, r *http.Request, id string) {
 	if owner == "" {
 		owner = storage_lock.NewOwnerIdGenerator().GenOwnerId()
 	}
+	readMode := strings.EqualFold(strings.TrimSpace(req.Mode), "read")
 	var acquireErr error
-	if req.Wait {
+	if readMode {
+		if req.Wait {
+			acquireErr = lock.RLock(r.Context(), owner)
+		} else {
+			acquireErr = lock.TryRLock(r.Context(), owner)
+		}
+	} else if req.Wait {
 		acquireErr = lock.Lock(r.Context(), owner)
 	} else {
 		acquireErr = lock.TryLock(r.Context(), owner)
 	}
 	if acquireErr != nil {
-		if errors.Is(acquireErr, storage_lock.ErrLockBusy) {
-			writeError(w, acquireErr)
-			return
-		}
 		writeError(w, acquireErr)
 		return
 	}
-	token, err := lock.GetFencingToken(r.Context(), owner)
+	token, expire, err := acquiredToken(r.Context(), lock, owner)
 	if err != nil {
-		_ = lock.UnLock(context.WithoutCancel(r.Context()), owner)
+		releaseAcquired(r.Context(), lock, owner)
 		writeError(w, err)
 		return
 	}
-	expire, _ := lock.TTL(r.Context(), owner)
 	writeJSON(w, AcquireResult{LockID: id, OwnerID: owner, FencingToken: token, LeaseExpire: expire.String()})
+}
+
+// acquiredToken 返回这次获取的 fencing 版本和剩余租约。读锁不能走只认独占持有者的接口。
+func acquiredToken(ctx context.Context, lock *storage_lock.StorageLock, owner string) (storage.Version, time.Duration, error) {
+	status, err := lock.Inspect(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if status.Information.ReadLock {
+		if !status.Held || status.Information.ReadDepth(owner) <= 0 {
+			return 0, 0, storage_lock.ErrLockNotBelongYou
+		}
+		return status.Information.Version, status.RemainingLease, nil
+	}
+	token, err := lock.GetFencingToken(ctx, owner)
+	if err != nil {
+		return 0, 0, err
+	}
+	ttl, err := lock.TTL(ctx, owner)
+	if err != nil {
+		return 0, 0, err
+	}
+	return token, ttl, nil
+}
+
+func releaseAcquired(ctx context.Context, lock *storage_lock.StorageLock, owner string) {
+	ctx = context.WithoutCancel(ctx)
+	status, err := lock.Inspect(ctx)
+	if err == nil && status.Information.ReadLock {
+		_ = lock.RUnLock(ctx, owner)
+		return
+	}
+	_ = lock.UnLock(ctx, owner)
 }
 
 func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
@@ -210,11 +244,15 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.OwnerID == "" {
-		http.Error(w, "owner_id required", http.StatusBadRequest)
-		return
-	}
 	options := s.options
+	if req.TTL != "" {
+		ttl, err := time.ParseDuration(req.TTL)
+		if err != nil {
+			http.Error(w, "invalid ttl: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		options.LeaseExpireAfter = ttl
+	}
 	options.LockId = s.fullLockID(id)
 	lock, err := storage_lock.NewStorageLockWithOptions(s.storage, &options)
 	if err != nil {
@@ -225,18 +263,18 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, err)
 		return
 	}
-	expire, _ := lock.TTL(r.Context(), req.OwnerID)
-	writeJSON(w, AcquireResult{LockID: id, OwnerID: req.OwnerID, LeaseExpire: expire.String()})
+	status, err := lock.Inspect(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, AcquireResult{LockID: id, OwnerID: req.OwnerID, LeaseExpire: status.RemainingLease.String()})
 }
 
 func (s *Service) release(w http.ResponseWriter, r *http.Request, id string) {
 	var req ReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.OwnerID == "" {
-		http.Error(w, "owner_id required", http.StatusBadRequest)
 		return
 	}
 	options := s.options
@@ -246,25 +284,34 @@ func (s *Service) release(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, err)
 		return
 	}
-	if err := lock.UnLock(r.Context(), req.OwnerID); err != nil {
-		writeError(w, err)
+	status, inspectErr := lock.Inspect(r.Context())
+	var releaseErr error
+	if inspectErr == nil && status.Information.ReadLock && status.Information.ReadDepth(req.OwnerID) > 0 {
+		releaseErr = lock.RUnLock(r.Context(), req.OwnerID)
+	} else {
+		releaseErr = lock.UnLock(r.Context(), req.OwnerID)
+	}
+	if releaseErr != nil {
+		writeError(w, releaseErr)
 		return
 	}
 	writeJSON(w, map[string]string{"released": id})
 }
 
 func (s *Service) inspectLock(w http.ResponseWriter, r *http.Request, id string) {
-	server, err := New(s.storage)
+	options := s.options
+	options.LockId = s.fullLockID(id)
+	lock, err := storage_lock.NewStorageLockWithOptions(s.storage, &options)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	view, err := server.inspect(r.Context(), s.fullLockID(id))
+	status, err := lock.Inspect(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, view)
+	writeJSON(w, viewFromStatus(status))
 }
 
 func (s *Service) waiters(w http.ResponseWriter, r *http.Request, id string) {
