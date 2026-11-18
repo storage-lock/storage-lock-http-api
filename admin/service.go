@@ -333,10 +333,36 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	server, err := New(s.storage)
+	// 必须带命名空间前缀列出，否则会把其他租户的锁一并返回。
+	// 这里不能走 admin.New(...).list：那个只读服务面向单租户部署，
+	// 它内部调用 ListLocks(storage, "")，在这里会跨租户泄露。
+	prefix := ""
+	if s.namespace != "" {
+		prefix = s.namespace + "/"
+	}
+	items, err := storage_lock.ListLocks(r.Context(), s.storage, prefix)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	server.list(w, r)
+	views := []lockView{}
+	for items.Next() {
+		if info := items.Value(); info != nil {
+			if s.namespace != "" && !strings.HasPrefix(info.LockId, s.namespace+"/") {
+				continue
+			}
+			// 与 Server.view 同口径：用当前时间判断租约是否仍有效。
+			held := info.LockCount > 0 && time.Now().Before(info.LeaseExpireTime)
+			view := lockView{
+				LockID: info.LockId, OwnerID: info.OwnerId, Held: held, ReadLock: info.ReadLock,
+				LockCount: info.LockCount, Version: info.Version, WriteIntentOwner: info.WriteIntentOwner,
+				Waiters: append([]storage.LockWaiter(nil), info.Waiters...),
+			}
+			if held {
+				view.RemainingLease = info.LeaseExpireTime.Sub(time.Now()).String()
+			}
+			views = append(views, view)
+		}
+	}
+	writeJSON(w, views)
 }
